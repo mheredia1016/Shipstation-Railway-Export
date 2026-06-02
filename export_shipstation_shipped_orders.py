@@ -113,13 +113,13 @@ def write_csv(shipments: List[Dict[str, Any]], date_stamp: str) -> Path:
         if not order_number or order_number in seen:
             continue
         seen.add(order_number)
-        rows.append({"Order Number": order_number})
+        rows.append({"Channel Reference Number": order_number})
 
     with output_path.open("w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=["Order Number"])
+        writer = csv.DictWriter(f, fieldnames=["Channel Reference Number"])
         writer.writeheader()
         writer.writerows(rows)
-    print(f"Wrote {len(rows)} order numbers to {output_path}")
+    print(f"Wrote {len(rows)} channel reference numbers to {output_path}")
     return output_path
 
 
