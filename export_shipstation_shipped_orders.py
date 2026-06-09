@@ -3,11 +3,11 @@ import os
 import sys
 from base64 import b64encode
 from datetime import datetime, time, timedelta
+from ftplib import FTP
 from pathlib import Path
 from typing import Any, Dict, List
 from zoneinfo import ZoneInfo
 
-import paramiko
 import requests
 
 SHIPSTATION_API_BASE = os.getenv("SHIPSTATION_API_BASE", "https://ssapi.shipstation.com")
@@ -15,20 +15,20 @@ SHIPSTATION_API_KEY = os.getenv("SHIPSTATION_API_KEY", "").strip()
 SHIPSTATION_API_SECRET = os.getenv("SHIPSTATION_API_SECRET", "").strip()
 
 TIMEZONE = os.getenv("TIMEZONE", "America/Chicago")
-DATE_MODE = os.getenv("DATE_MODE", "today").strip().lower()  # today or yesterday
+DATE_MODE = os.getenv("DATE_MODE", "today").strip().lower()
 STORE_ID = os.getenv("SHIPSTATION_STORE_ID", "").strip()
 PAGE_SIZE = int(os.getenv("SHIPSTATION_PAGE_SIZE", "500"))
 
 EXPORT_DIR = Path(os.getenv("EXPORT_DIR", "exports"))
 CSV_PREFIX = os.getenv("CSV_PREFIX", "shipstation-shipped-orders")
 
-SFTP_ENABLED = os.getenv("SFTP_ENABLED", os.getenv("FTP_ENABLED", "true")).lower() == "true"
-SFTP_HOST = os.getenv("SFTP_HOST", os.getenv("FTP_HOST", "")).strip()
-SFTP_PORT = int(os.getenv("SFTP_PORT", os.getenv("FTP_PORT", "22")))
-SFTP_USERNAME = os.getenv("SFTP_USERNAME", os.getenv("FTP_USERNAME", "")).strip()
-SFTP_PASSWORD = os.getenv("SFTP_PASSWORD", os.getenv("FTP_PASSWORD", "")).strip()
-SFTP_REMOTE_DIR = os.getenv("SFTP_REMOTE_DIR", os.getenv("FTP_REMOTE_DIR", "/")).strip()
-SFTP_UPLOAD_LATEST = os.getenv("SFTP_UPLOAD_LATEST", os.getenv("FTP_UPLOAD_LATEST", "true")).lower() == "true"
+FTP_ENABLED = os.getenv("FTP_ENABLED", "true").lower() == "true"
+FTP_HOST = os.getenv("FTP_HOST", "").strip()
+FTP_PORT = int(os.getenv("FTP_PORT", "21"))
+FTP_USERNAME = os.getenv("FTP_USERNAME", "").strip()
+FTP_PASSWORD = os.getenv("FTP_PASSWORD", "").strip()
+FTP_REMOTE_DIR = os.getenv("FTP_REMOTE_DIR", "/").strip()
+FTP_UPLOAD_LATEST = os.getenv("FTP_UPLOAD_LATEST", "false").lower() == "true"
 
 
 def require_env() -> None:
@@ -37,13 +37,13 @@ def require_env() -> None:
         missing.append("SHIPSTATION_API_KEY")
     if not SHIPSTATION_API_SECRET:
         missing.append("SHIPSTATION_API_SECRET")
-    if SFTP_ENABLED:
-        if not SFTP_HOST:
-            missing.append("SFTP_HOST")
-        if not SFTP_USERNAME:
-            missing.append("SFTP_USERNAME")
-        if not SFTP_PASSWORD:
-            missing.append("SFTP_PASSWORD")
+    if FTP_ENABLED:
+        if not FTP_HOST:
+            missing.append("FTP_HOST")
+        if not FTP_USERNAME:
+            missing.append("FTP_USERNAME")
+        if not FTP_PASSWORD:
+            missing.append("FTP_PASSWORD")
     if missing:
         raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
 
@@ -106,6 +106,7 @@ def shipment_order_number(shipment: Dict[str, Any]) -> str:
 def write_csv(shipments: List[Dict[str, Any]], date_stamp: str) -> Path:
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     output_path = EXPORT_DIR / f"{CSV_PREFIX}-{date_stamp}.csv"
+
     seen = set()
     rows = []
     for shipment in shipments:
@@ -119,46 +120,49 @@ def write_csv(shipments: List[Dict[str, Any]], date_stamp: str) -> Path:
         writer = csv.DictWriter(f, fieldnames=["Channel Reference Number"])
         writer.writeheader()
         writer.writerows(rows)
+
     print(f"Wrote {len(rows)} channel reference numbers to {output_path}")
     return output_path
 
 
-def sftp_mkdirs(sftp: paramiko.SFTPClient, remote_dir: str) -> None:
+def ftp_mkdirs(ftp: FTP, remote_dir: str) -> None:
     if not remote_dir or remote_dir == "/":
-        sftp.chdir("/")
         return
-    current = ""
+
     for part in remote_dir.strip("/").split("/"):
-        current += "/" + part
         try:
-            sftp.stat(current)
-        except FileNotFoundError:
-            sftp.mkdir(current)
-    sftp.chdir(remote_dir)
+            ftp.mkd(part)
+        except Exception:
+            pass
+        ftp.cwd(part)
 
 
 def upload_file(local_path: Path) -> None:
-    if not SFTP_ENABLED:
-        print("SFTP upload disabled.")
+    if not FTP_ENABLED:
+        print("FTP upload disabled.")
         return
 
-    transport = paramiko.Transport((SFTP_HOST, SFTP_PORT))
-    transport.connect(username=SFTP_USERNAME, password=SFTP_PASSWORD)
-    sftp = paramiko.SFTPClient.from_transport(transport)
-    try:
-        sftp_mkdirs(sftp, SFTP_REMOTE_DIR)
-        remote_file = f"{SFTP_REMOTE_DIR.rstrip('/')}/{local_path.name}"
-        sftp.put(str(local_path), remote_file)
-        print(f"Uploaded {local_path.name} to {SFTP_REMOTE_DIR}")
+    ftp = FTP()
+    ftp.connect(FTP_HOST, FTP_PORT, timeout=60)
+    ftp.login(FTP_USERNAME, FTP_PASSWORD)
 
-        if SFTP_UPLOAD_LATEST:
+    try:
+        if FTP_REMOTE_DIR and FTP_REMOTE_DIR != "/":
+            ftp_mkdirs(ftp, FTP_REMOTE_DIR)
+
+        with local_path.open("rb") as f:
+            ftp.storbinary(f"STOR {local_path.name}", f)
+
+        print(f"Uploaded {local_path.name} to {FTP_REMOTE_DIR or '/'}")
+
+        if FTP_UPLOAD_LATEST:
             latest_name = f"{CSV_PREFIX}-latest.csv"
-            latest_remote_file = f"{SFTP_REMOTE_DIR.rstrip('/')}/{latest_name}"
-            sftp.put(str(local_path), latest_remote_file)
-            print(f"Uploaded {latest_name} to {SFTP_REMOTE_DIR}")
+            with local_path.open("rb") as f:
+                ftp.storbinary(f"STOR {latest_name}", f)
+            print(f"Uploaded {latest_name} to {FTP_REMOTE_DIR or '/'}")
+
     finally:
-        sftp.close()
-        transport.close()
+        ftp.quit()
 
 
 def main() -> int:
