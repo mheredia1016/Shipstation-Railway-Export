@@ -19,6 +19,12 @@ DATE_MODE = os.getenv("DATE_MODE", "today").strip().lower()
 STORE_ID = os.getenv("SHIPSTATION_STORE_ID", "").strip()
 PAGE_SIZE = int(os.getenv("SHIPSTATION_PAGE_SIZE", "500"))
 
+# Optional backfill mode.
+# If START_DATE and END_DATE are set, the script creates/uploads one CSV per day in that range.
+# Format: YYYY-MM-DD
+START_DATE = os.getenv("START_DATE", "").strip()
+END_DATE = os.getenv("END_DATE", "").strip()
+
 EXPORT_DIR = Path(os.getenv("EXPORT_DIR", "exports"))
 CSV_PREFIX = os.getenv("CSV_PREFIX", "shipstation-shipped-orders")
 
@@ -33,10 +39,13 @@ FTP_UPLOAD_LATEST = os.getenv("FTP_UPLOAD_LATEST", "false").lower() == "true"
 
 def require_env() -> None:
     missing = []
+
     if not SHIPSTATION_API_KEY:
         missing.append("SHIPSTATION_API_KEY")
+
     if not SHIPSTATION_API_SECRET:
         missing.append("SHIPSTATION_API_SECRET")
+
     if FTP_ENABLED:
         if not FTP_HOST:
             missing.append("FTP_HOST")
@@ -44,6 +53,7 @@ def require_env() -> None:
             missing.append("FTP_USERNAME")
         if not FTP_PASSWORD:
             missing.append("FTP_PASSWORD")
+
     if missing:
         raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
 
@@ -54,23 +64,55 @@ def auth_headers() -> Dict[str, str]:
     return {"Authorization": f"Basic {token}", "Accept": "application/json"}
 
 
-def date_range_for_mode() -> tuple[str, str, str]:
+def single_target_date():
     tz = ZoneInfo(TIMEZONE)
     now_local = datetime.now(tz)
-    target = now_local.date() - timedelta(days=1) if DATE_MODE == "yesterday" else now_local.date()
-    start_local = datetime.combine(target, time.min, tzinfo=tz)
-    end_local = datetime.combine(target, time.max.replace(microsecond=0), tzinfo=tz)
-    return start_local.isoformat(), end_local.isoformat(), target.strftime("%Y-%m-%d")
+
+    if DATE_MODE == "yesterday":
+        return now_local.date() - timedelta(days=1)
+
+    return now_local.date()
+
+
+def date_targets():
+    if START_DATE and END_DATE:
+        start = datetime.strptime(START_DATE, "%Y-%m-%d").date()
+        end = datetime.strptime(END_DATE, "%Y-%m-%d").date()
+
+        if end < start:
+            raise RuntimeError("END_DATE cannot be earlier than START_DATE")
+
+        days = []
+        current = start
+
+        while current <= end:
+            days.append(current)
+            current += timedelta(days=1)
+
+        return days
+
+    return [single_target_date()]
+
+
+def date_range_for_target(target_date):
+    tz = ZoneInfo(TIMEZONE)
+
+    start_local = datetime.combine(target_date, time.min, tzinfo=tz)
+    end_local = datetime.combine(target_date, time.max.replace(microsecond=0), tzinfo=tz)
+
+    return start_local.isoformat(), end_local.isoformat(), target_date.strftime("%Y-%m-%d")
 
 
 def get_shipments_page(page: int, start_date: str, end_date: str) -> Dict[str, Any]:
     url = f"{SHIPSTATION_API_BASE.rstrip('/')}/shipments"
+
     params = {
         "shipDateStart": start_date,
         "shipDateEnd": end_date,
         "page": page,
         "pageSize": PAGE_SIZE,
     }
+
     if STORE_ID:
         params["storeId"] = STORE_ID
 
@@ -79,40 +121,58 @@ def get_shipments_page(page: int, start_date: str, end_date: str) -> Dict[str, A
     return response.json()
 
 
-def fetch_all_shipments() -> tuple[List[Dict[str, Any]], str]:
-    start_date, end_date, date_stamp = date_range_for_mode()
+def fetch_all_shipments_for_day(target_date):
+    start_date, end_date, date_stamp = date_range_for_target(target_date)
+
     print(f"Fetching ShipStation shipments from {start_date} to {end_date}")
 
     page = 1
     all_shipments: List[Dict[str, Any]] = []
+
     while True:
         payload = get_shipments_page(page, start_date, end_date)
         shipments = payload.get("shipments", [])
+
         if not isinstance(shipments, list):
             shipments = []
+
         print(f"Fetched page {page}: {len(shipments)} shipments")
+
         all_shipments.extend(shipments)
+
         total_pages = int(payload.get("pages") or 1)
+
         if page >= total_pages:
             break
+
         page += 1
+
     return all_shipments, date_stamp
 
 
 def shipment_order_number(shipment: Dict[str, Any]) -> str:
-    return str(shipment.get("orderNumber") or shipment.get("order_number") or shipment.get("orderKey") or "").strip()
+    return str(
+        shipment.get("orderNumber")
+        or shipment.get("order_number")
+        or shipment.get("orderKey")
+        or ""
+    ).strip()
 
 
 def write_csv(shipments: List[Dict[str, Any]], date_stamp: str) -> Path:
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+
     output_path = EXPORT_DIR / f"{CSV_PREFIX}-{date_stamp}.csv"
 
     seen = set()
     rows = []
+
     for shipment in shipments:
         order_number = shipment_order_number(shipment)
+
         if not order_number or order_number in seen:
             continue
+
         seen.add(order_number)
         rows.append({"Channel Reference Number": order_number})
 
@@ -122,6 +182,7 @@ def write_csv(shipments: List[Dict[str, Any]], date_stamp: str) -> Path:
         writer.writerows(rows)
 
     print(f"Wrote {len(rows)} channel reference numbers to {output_path}")
+
     return output_path
 
 
@@ -134,6 +195,7 @@ def ftp_mkdirs(ftp: FTP, remote_dir: str) -> None:
             ftp.mkd(part)
         except Exception:
             pass
+
         ftp.cwd(part)
 
 
@@ -157,8 +219,10 @@ def upload_file(local_path: Path) -> None:
 
         if FTP_UPLOAD_LATEST:
             latest_name = f"{CSV_PREFIX}-latest.csv"
+
             with local_path.open("rb") as f:
                 ftp.storbinary(f"STOR {latest_name}", f)
+
             print(f"Uploaded {latest_name} to {FTP_REMOTE_DIR or '/'}")
 
     finally:
@@ -168,11 +232,18 @@ def upload_file(local_path: Path) -> None:
 def main() -> int:
     try:
         require_env()
-        shipments, date_stamp = fetch_all_shipments()
-        csv_path = write_csv(shipments, date_stamp)
-        upload_file(csv_path)
+
+        targets = date_targets()
+        print(f"Processing {len(targets)} day(s): {', '.join(d.strftime('%Y-%m-%d') for d in targets)}")
+
+        for target in targets:
+            shipments, date_stamp = fetch_all_shipments_for_day(target)
+            csv_path = write_csv(shipments, date_stamp)
+            upload_file(csv_path)
+
         print("Done.")
         return 0
+
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
